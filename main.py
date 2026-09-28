@@ -54,6 +54,7 @@ logger = logging.getLogger("meme_court")
 
 TRIAL_DURATION_SECONDS = 90
 MUTE_DURATION_SECONDS = 180
+MAX_COMMAND_AGE_SECONDS = 60  # commands older than this are ignored as stale
 
 # --------------------------------------------------------------------------- #
 # STATE MANAGEMENT
@@ -281,6 +282,13 @@ async def fetch_avatar_bytes(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
 async def indict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat_id = update.effective_chat.id
+
+    # Safety net: ignore commands that were sent long before we handled them
+    # (e.g. delivered late after a network outage or restart).
+    age = (datetime.now(timezone.utc) - message.date).total_seconds()
+    if age > MAX_COMMAND_AGE_SECONDS:
+        logger.info("Ignoring stale /indict (%.0fs old) in chat %s", age, chat_id)
+        return
 
     if chat_id in active_trials:
         await message.reply_text(
@@ -528,7 +536,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_vote, pattern=r"^vote\|"))
 
     logger.info("Starting Meme Court bot (long polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True discards everything users sent while the bot was
+    # offline/restarting (e.g. a Render redeploy), so old /indict commands are
+    # never replayed.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
