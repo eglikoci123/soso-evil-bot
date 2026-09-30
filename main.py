@@ -1,14 +1,21 @@
 """
 Meme Court — a Telegram group bot that puts members on trial for bad takes.
 
+Flow
+----
+1. Someone replies to a message with /indict <crime>.
+2. A 90-second JURY LOBBY opens. People tap "JOIN THE JURY".
+3. After 90 seconds:
+     - fewer than MIN_JURORS joined  -> lobby closes, case dismissed.
+     - enough jurors joined          -> 90-second voting phase begins.
+4. Only jurors vote. Verdict is tallied, defendant is muted if GUILTY
+   (when the bot has admin rights).
+
 Architecture
 ------------
 - python-telegram-bot v20+ (async, ApplicationBuilder)
-- In-memory state (see `active_trials` below) — swap for SQLite/Redis later,
-  see the comment on that dict for exactly how.
-- Pillow generates a "WANTED" mugshot PNG in memory (io.BytesIO), no disk writes.
-- A 90-second asyncio background task tallies votes and delivers the verdict,
-  optionally muting the defendant if the bot has admin rights in the chat.
+- In-memory state (see `active_trials`) — swap for SQLite/Redis later.
+- Pillow generates a "WANTED" mugshot PNG in memory (io.BytesIO).
 """
 
 import io
@@ -16,14 +23,11 @@ import os
 import random
 import asyncio
 import logging
-
-from dotenv import load_dotenv  # local dev convenience: loads .env if present
-
-load_dotenv()
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
+from dotenv import load_dotenv  # local dev convenience: loads .env if present
 from PIL import Image, ImageDraw, ImageFont
 
 from telegram import (
@@ -42,6 +46,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
+load_dotenv()
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -52,30 +58,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("meme_court")
 
-TRIAL_DURATION_SECONDS = 90
+LOBBY_DURATION_SECONDS = 90     # time to join the jury before the lobby closes
+TRIAL_DURATION_SECONDS = 90     # voting time once the trial starts
+MIN_JURORS = 3                  # lobby closes if fewer people join
 MUTE_DURATION_SECONDS = 180
-MAX_COMMAND_AGE_SECONDS = 60  # commands older than this are ignored as stale
+MAX_COMMAND_AGE_SECONDS = 60    # commands older than this are ignored as stale
 
 # --------------------------------------------------------------------------- #
 # STATE MANAGEMENT
 #
 # `active_trials` is a plain in-memory dict: chat_id -> Trial. It is lost on
-# restart and does not work across multiple bot processes. That's fine for a
-# single-instance deployment (e.g. one Render worker).
+# restart and does not work across multiple bot processes. Fine for a single
+# instance (e.g. one Render worker).
 #
 # To swap in SQLite:
-#   - Create a `trials` table: chat_id INTEGER PRIMARY KEY, message_id, 
-#     prosecutor_id, defendant_id, crime TEXT, votes TEXT (JSON blob), 
-#     created_at TIMESTAMP.
-#   - Replace `active_trials[chat_id] = trial` with an INSERT/UPDATE, and
-#     `active_trials.pop(chat_id)` with a DELETE.
-#   - Replace `active_trials.get(chat_id)` with a SELECT + json.loads(votes).
+#   - `trials` table: chat_id INTEGER PRIMARY KEY, message_id, prosecutor_id,
+#     defendant_id, crime TEXT, phase TEXT, jurors TEXT (JSON),
+#     votes TEXT (JSON), created_at TIMESTAMP.
+#   - Replace dict set/pop/get with INSERT-UPDATE / DELETE / SELECT.
 #
 # To swap in Redis:
-#   - Store each trial as a hash `trial:{chat_id}` (HSET) with an expiry
-#     (EXPIRE) of TRIAL_DURATION_SECONDS, so crashed trials self-clean.
-#   - Store votes as a Redis hash `trial:{chat_id}:votes` (user_id -> choice).
-#   - This also lets you run the bot across multiple processes/webhooks.
+#   - Hash `trial:{chat_id}` with EXPIRE, plus `trial:{chat_id}:jurors` and
+#     `trial:{chat_id}:votes` hashes.
 # --------------------------------------------------------------------------- #
 
 
@@ -88,8 +92,11 @@ class Trial:
     defendant_id: int
     defendant_name: str
     crime: str
-    votes: Dict[int, str] = field(default_factory=dict)       # user_id -> "guilty" | "innocent"
+    votes: Dict[int, str] = field(default_factory=dict)        # user_id -> "guilty" | "innocent"
     voter_names: Dict[int, str] = field(default_factory=dict)
+    jurors: Dict[int, str] = field(default_factory=dict)       # user_id -> name
+    phase: str = "lobby"                                        # "lobby" | "voting"
+    has_photo: bool = True
     task: Optional[asyncio.Task] = None
     ended: bool = False
 
@@ -109,7 +116,7 @@ def escape_md(text: str) -> str:
 
 
 async def send_with_retry(func, *args, max_retries: int = 3, **kwargs):
-    """Call a bot method, retrying once on RetryAfter (rate limit) or TimedOut."""
+    """Call a bot method, retrying on RetryAfter (rate limit) or TimedOut."""
     last_exc = None
     for attempt in range(max_retries):
         try:
@@ -128,21 +135,72 @@ async def send_with_retry(func, *args, max_retries: int = 3, **kwargs):
 
 
 def build_keyboard(trial: Trial) -> InlineKeyboardMarkup:
+    """Voting keyboard."""
     guilty_count = sum(1 for v in trial.votes.values() if v == "guilty")
     innocent_count = sum(1 for v in trial.votes.values() if v == "innocent")
-    buttons = [
-        [
-            InlineKeyboardButton(
-                f"🔨 GUILTY ({guilty_count})",
-                callback_data=f"vote|guilty|{trial.chat_id}",
-            ),
-            InlineKeyboardButton(
-                f"😇 INNOCENT ({innocent_count})",
-                callback_data=f"vote|innocent|{trial.chat_id}",
-            ),
-        ]
-    ]
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"🔨 GUILTY ({guilty_count})",
+            callback_data=f"vote|guilty|{trial.chat_id}",
+        ),
+        InlineKeyboardButton(
+            f"😇 INNOCENT ({innocent_count})",
+            callback_data=f"vote|innocent|{trial.chat_id}",
+        ),
+    ]])
+
+
+def build_lobby_keyboard(trial: Trial) -> InlineKeyboardMarkup:
+    """Jury lobby keyboard."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"🙋 JOIN THE JURY ({len(trial.jurors)}/{MIN_JURORS} needed)",
+            callback_data=f"join|{trial.chat_id}",
+        )
+    ]])
+
+
+def lobby_caption(trial: Trial) -> str:
+    return (
+        "🏛️ *MEME COURT IS OPENING* 🏛️\n\n"
+        f"*Prosecutor:* {escape_md(trial.prosecutor_name)}\n"
+        f"*Defendant:* {escape_md(trial.defendant_name)}\n"
+        f"*Charge:* {escape_md(trial.crime)}\n\n"
+        f"Tap *JOIN THE JURY* within *{LOBBY_DURATION_SECONDS} seconds*.\n"
+        f"At least *{MIN_JURORS} jurors* are needed or the lobby closes.\n"
+        "_The defendant may not join the jury._"
+    )
+
+
+def voting_caption(trial: Trial) -> str:
+    return (
+        "🏛️ *MEME COURT IS NOW IN SESSION* 🏛️\n\n"
+        f"*Prosecutor:* {escape_md(trial.prosecutor_name)}\n"
+        f"*Defendant:* {escape_md(trial.defendant_name)}\n"
+        f"*Charge:* {escape_md(trial.crime)}\n"
+        f"*Jurors:* {len(trial.jurors)}\n\n"
+        f"Jurors, you have *{TRIAL_DURATION_SECONDS} seconds* to cast your verdict."
+    )
+
+
+async def edit_trial_message(context, trial: Trial, text: str, markup) -> None:
+    """Edit the trial post whether it's a photo (caption) or plain text."""
+    try:
+        if trial.has_photo:
+            await context.bot.edit_message_caption(
+                chat_id=trial.chat_id, message_id=trial.message_id,
+                caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup,
+            )
+        else:
+            await context.bot.edit_message_text(
+                chat_id=trial.chat_id, message_id=trial.message_id,
+                text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup,
+            )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("Failed to edit trial message in %s: %s", trial.chat_id, e)
+    except (TimedOut, NetworkError, Forbidden) as e:
+        logger.warning("Could not edit trial message in %s: %s", trial.chat_id, e)
 
 
 # --------------------------------------------------------------------------- #
@@ -206,9 +264,9 @@ def generate_mugshot(defendant_name: str, crime: str, avatar_bytes: Optional[byt
     # header banner
     draw.rectangle([0, 0, width, 90], fill=(58, 14, 14))
     draw.text((width // 2, 45), "MEME COURT", font=_load_font(42),
-               fill=(230, 210, 170), anchor="mm")
+              fill=(230, 210, 170), anchor="mm")
 
-    # avatar (sepia-toned to sell the "mugshot" look)
+    # avatar (grayscale to sell the "mugshot" look)
     avatar_size = 260
     avatar_box = (width // 2 - avatar_size // 2, 115)
     if avatar_bytes:
@@ -222,7 +280,7 @@ def generate_mugshot(defendant_name: str, crime: str, avatar_bytes: Optional[byt
     else:
         avatar_img = _placeholder_avatar(avatar_size)
 
-    avatar_img = avatar_img.convert("L").convert("RGB")  # grayscale -> mugshot vibe
+    avatar_img = avatar_img.convert("L").convert("RGB")
     bg.paste(avatar_img, avatar_box)
     draw.rectangle(
         [
@@ -276,15 +334,14 @@ async def fetch_avatar_bytes(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
 
 
 # --------------------------------------------------------------------------- #
-# Command: /indict
+# Command: /indict  (opens the jury lobby)
 # --------------------------------------------------------------------------- #
 
 async def indict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat_id = update.effective_chat.id
 
-    # Safety net: ignore commands that were sent long before we handled them
-    # (e.g. delivered late after a network outage or restart).
+    # Ignore commands that were sent long before we handled them
     age = (datetime.now(timezone.utc) - message.date).total_seconds()
     if age > MAX_COMMAND_AGE_SECONDS:
         logger.info("Ignoring stale /indict (%.0fs old) in chat %s", age, chat_id)
@@ -321,23 +378,6 @@ async def indict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     defendant_name = defendant.first_name or defendant.username or "Defendant"
     prosecutor_name = prosecutor.first_name or prosecutor.username or "Prosecutor"
 
-    caption = (
-        "🏛️ *MEME COURT IS NOW IN SESSION* 🏛️\n\n"
-        f"*Prosecutor:* {escape_md(prosecutor_name)}\n"
-        f"*Defendant:* {escape_md(defendant_name)}\n"
-        f"*Charge:* {escape_md(crime)}\n\n"
-        f"You have *{TRIAL_DURATION_SECONDS} seconds* to cast your verdict.\n"
-        "_The defendant may not vote in their own trial._"
-    )
-
-    avatar_bytes = await fetch_avatar_bytes(context, defendant.id)
-
-    try:
-        mugshot = generate_mugshot(defendant_name, crime, avatar_bytes)
-    except Exception as e:
-        logger.error("Mugshot generation failed, falling back to text-only trial: %s", e)
-        mugshot = None
-
     trial = Trial(
         chat_id=chat_id,
         message_id=0,
@@ -347,23 +387,28 @@ async def indict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         defendant_name=defendant_name,
         crime=crime,
     )
-    keyboard = build_keyboard(trial)
+
+    avatar_bytes = await fetch_avatar_bytes(context, defendant.id)
+    try:
+        mugshot = generate_mugshot(defendant_name, crime, avatar_bytes)
+    except Exception as e:
+        logger.error("Mugshot generation failed, falling back to text-only trial: %s", e)
+        mugshot = None
+
+    trial.has_photo = mugshot is not None
+    caption = lobby_caption(trial)
+    keyboard = build_lobby_keyboard(trial)
 
     try:
         if mugshot is not None:
             sent = await send_with_retry(
-                message.reply_photo,
-                photo=mugshot,
-                caption=caption,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard,
+                message.reply_photo, photo=mugshot, caption=caption,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
             )
         else:
             sent = await send_with_retry(
-                message.reply_text,
-                text=caption,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard,
+                message.reply_text, text=caption,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
             )
     except (BadRequest, Forbidden, TimedOut, NetworkError) as e:
         logger.error("Failed to post trial message: %s", e)
@@ -378,7 +423,49 @@ async def indict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Voting
+# Joining the jury (lobby phase)
+# --------------------------------------------------------------------------- #
+
+async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split("|")
+
+    try:
+        chat_id = int(parts[1])
+    except (IndexError, ValueError):
+        await query.answer("Malformed summons.", show_alert=True)
+        return
+
+    trial = active_trials.get(chat_id)
+    if (not trial or trial.ended or trial.phase != "lobby"
+            or query.message.message_id != trial.message_id):
+        await query.answer("The jury lobby is closed.", show_alert=True)
+        return
+
+    if user.id == trial.defendant_id:
+        await query.answer("The defendant cannot sit on their own jury!", show_alert=True)
+        return
+
+    if user.id in trial.jurors:
+        await query.answer("You're already on the jury.")
+        return
+
+    trial.jurors[user.id] = user.first_name or user.username or "Juror"
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=build_lobby_keyboard(trial))
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("Failed to refresh lobby count: %s", e)
+    except (TimedOut, NetworkError) as e:
+        logger.warning("Network hiccup updating lobby count: %s", e)
+
+    await query.answer("You've joined the jury! ⚖️")
+
+
+# --------------------------------------------------------------------------- #
+# Voting (voting phase, jurors only)
 # --------------------------------------------------------------------------- #
 
 async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -391,6 +478,10 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     _, choice, chat_id_str = parts
+    if choice not in ("guilty", "innocent"):
+        await query.answer("Malformed ballot.", show_alert=True)
+        return
+
     try:
         chat_id = int(chat_id_str)
     except ValueError:
@@ -398,12 +489,17 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     trial = active_trials.get(chat_id)
-    if not trial or trial.ended or query.message.message_id != trial.message_id:
-        await query.answer("This trial has already concluded.", show_alert=True)
+    if (not trial or trial.ended or trial.phase != "voting"
+            or query.message.message_id != trial.message_id):
+        await query.answer("Voting isn't open for this trial.", show_alert=True)
         return
 
     if user.id == trial.defendant_id:
         await query.answer("The defendant cannot vote in their own trial!", show_alert=True)
+        return
+
+    if user.id not in trial.jurors:
+        await query.answer("Only jurors who joined the lobby can vote.", show_alert=True)
         return
 
     if trial.votes.get(user.id) == choice:
@@ -416,7 +512,7 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         await query.edit_message_reply_markup(reply_markup=build_keyboard(trial))
     except BadRequest as e:
-        if "Message is not modified" not in str(e):
+        if "not modified" not in str(e).lower():
             logger.warning("Failed to refresh vote counts: %s", e)
     except (TimedOut, NetworkError) as e:
         logger.warning("Network hiccup updating vote counts: %s", e)
@@ -425,7 +521,7 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------- #
-# Verdict & enforcement
+# Timer, verdict & enforcement
 # --------------------------------------------------------------------------- #
 
 async def try_mute(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
@@ -447,6 +543,34 @@ async def try_mute(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: in
 
 
 async def run_trial_timer(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ---- Phase 1: jury lobby ----
+    try:
+        await asyncio.sleep(LOBBY_DURATION_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    trial = active_trials.get(chat_id)
+    if not trial or trial.ended:
+        return
+
+    if len(trial.jurors) < MIN_JURORS:
+        active_trials.pop(chat_id, None)
+        trial.ended = True
+        await edit_trial_message(
+            context, trial,
+            "🚪 *LOBBY CLOSED* 🚪\n\n"
+            f"Only {len(trial.jurors)}/{MIN_JURORS} jurors showed up in "
+            f"{LOBBY_DURATION_SECONDS} seconds.\n"
+            f"The case against *{escape_md(trial.defendant_name)}* is dismissed. "
+            "Lucky them. 🍀",
+            None,
+        )
+        return
+
+    # ---- Phase 2: voting ----
+    trial.phase = "voting"
+    await edit_trial_message(context, trial, voting_caption(trial), build_keyboard(trial))
+
     try:
         await asyncio.sleep(TRIAL_DURATION_SECONDS)
     except asyncio.CancelledError:
@@ -474,6 +598,7 @@ async def conclude_trial(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
         "⚖️ *THE COURT HAS REACHED A VERDICT* ⚖️\n\n"
         f"*Defendant:* {escape_md(trial.defendant_name)}\n"
         f"*Charge:* {escape_md(trial.crime)}\n"
+        f"*Jurors:* {len(trial.jurors)}\n"
         f"*Votes:* 🔨 {guilty_count}  vs  😇 {innocent_count}\n\n"
         f"*VERDICT: {verdict}*"
     )
@@ -533,6 +658,7 @@ def main() -> None:
     app = ApplicationBuilder().token(token).post_init(post_init).build()
 
     app.add_handler(CommandHandler("indict", indict))
+    app.add_handler(CallbackQueryHandler(handle_join, pattern=r"^join\|"))
     app.add_handler(CallbackQueryHandler(handle_vote, pattern=r"^vote\|"))
 
     logger.info("Starting Meme Court bot (long polling)...")
