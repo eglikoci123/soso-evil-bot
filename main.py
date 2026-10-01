@@ -953,3 +953,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Start health check server on a background thread
+    threading.Thread(target=start_health_check_server, daemon=True).start()
