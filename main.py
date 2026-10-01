@@ -7,13 +7,22 @@ Flow
 2. People tap "JOIN THE JURY". The defendant can't join.
 3. After 90s: if fewer than MIN_JURORS joined, the lobby closes and the case
    is dismissed. Otherwise voting opens for another 90s (jurors only).
-4. Verdict is delivered, optionally muting the defendant if the bot is admin.
+4. The defendant may shout OBJECTION! once (30% chance it's sustained and a
+   guilty vote is struck).
+5. Verdict is delivered, optionally muting the defendant (longer for landslides)
+   if the bot is admin. Results are saved to an in-memory rap sheet.
+
+Extras
+------
+- /rapsheet  -> shows a user's record in this chat (reply to someone, or self)
+- Any unknown command gets a random judge quip.
+- /start is deliberately ignored (no reply at all).
 
 Architecture
 ------------
 - python-telegram-bot v20+ (async, ApplicationBuilder)
-- In-memory state (`active_trials`) — see the comment on that dict for how to
-  swap in SQLite/Redis.
+- In-memory state (`active_trials`, `rap_sheets`) — see the comment below for
+  how to swap in SQLite/Redis.
 - Pillow generates a "WANTED" mugshot PNG in memory (io.BytesIO).
 """
 
@@ -45,7 +54,9 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # --------------------------------------------------------------------------- #
@@ -61,8 +72,74 @@ logger = logging.getLogger("meme_court")
 LOBBY_DURATION_SECONDS = 90     # time to join before the lobby closes
 TRIAL_DURATION_SECONDS = 90     # voting time once the trial starts
 MIN_JURORS = 3                  # lobby closes if fewer people join
-MUTE_DURATION_SECONDS = 180
+MUTE_BASE_SECONDS = 180         # mute for a 1-vote margin
+MUTE_STEP_SECONDS = 90          # extra mute per additional vote of margin
+MUTE_MAX_SECONDS = 600          # hard cap (10 minutes)
 MAX_COMMAND_AGE_SECONDS = 60    # commands older than this are ignored as stale
+OBJECTION_SUSTAIN_CHANCE = 0.30 # chance the judge sustains an objection
+RANDOM_REPLY_CHANCE = 1.0       # 1.0 = always quip on unknown commands; 0.5 = half the time
+
+# --------------------------------------------------------------------------- #
+# Flavor text
+# --------------------------------------------------------------------------- #
+
+QUIPS = [
+    "⚖️ The court has no idea what that command means, and neither do I.",
+    "🔨 *BANG BANG.* Order! ...I forgot why I did that.",
+    "🧑‍⚖️ Objection! ...to whatever you just typed.",
+    "📜 The bailiff has read your command and chose to laugh.",
+    "🏛️ This is a court, not a help desk. Try /indict.",
+    "🥱 The judge is currently on a snack break. Please hold.",
+    "👀 The court is watching. The court is always watching.",
+    "🕵️ Noted. This has been added to your file. Don't ask what file.",
+    "🍿 The jury is bored. Indict someone already.",
+    "🐐 Sustained. Overruled. Whatever. Moving on.",
+    "🤨 The court finds that command... suspicious.",
+    "🧂 The judge has seen your type of command before. Salty.",
+    "📞 Your lawyer is not picking up. Try again later.",
+    "🪑 Please remain seated. Nobody asked you anything.",
+    "🎭 Dramatic gavel noises. The command is denied.",
+]
+
+GUILTY_LINES = [
+    "The court has seen enough. Take them away.",
+    "The evidence was cringe, the verdict is clear.",
+    "The jury has spoken, and it was not kind.",
+    "Justice has been served, with a side of ratio.",
+]
+INNOCENT_LINES = [
+    "The take was bad, but not criminal. Walk free.",
+    "Acquitted. Reputation: damaged. Freedom: intact.",
+    "The jury felt merciful. Do not push your luck.",
+    "Case closed. The defendant lives to post again.",
+]
+HUNG_LINES = [
+    "The jury is hopelessly split. Everybody go home.",
+    "A perfect tie. The court is mildly annoyed.",
+    "No verdict. The gavel is confused.",
+]
+DISMISS_LINES = [
+    "Lucky them. 🍀",
+    "Nobody cared enough to show up. Brutal. 💀",
+    "The jury was out getting snacks. 🍕",
+]
+COMMUNITY_SERVICE = [
+    "Must post a cat photo within the hour. 🐱",
+    "Must admit 'I was wrong' in the next message they send. 🙇",
+    "Must compliment the prosecutor. Sincerely. 🤝",
+    "Must reveal their favorite guilty-pleasure song. 🎵",
+    "Must use only emojis for the next 5 messages. 😶",
+    "Must apologise to pineapple pizza. 🍍",
+]
+OBJECTION_SUSTAINED = [
+    "🧑‍⚖️ *SUSTAINED!* The judge strikes one guilty vote from the record.",
+    "🧑‍⚖️ *SUSTAINED!* That was a good point. One guilty vote vanishes.",
+]
+OBJECTION_OVERRULED = [
+    "🧑‍⚖️ *OVERRULED!* Sit down.",
+    "🧑‍⚖️ *OVERRULED!* Nice try, counselor.",
+    "🧑‍⚖️ *OVERRULED!* The judge didn't even look up.",
+]
 
 # --------------------------------------------------------------------------- #
 # STATE MANAGEMENT
@@ -71,10 +148,14 @@ MAX_COMMAND_AGE_SECONDS = 60    # commands older than this are ignored as stale
 # restart and does not work across multiple bot processes. That's fine for a
 # single-instance deployment (e.g. one Render worker).
 #
+# `rap_sheets` is chat_id -> user_id -> {"name", "guilty", "innocent", "hung"}.
+# Same caveat: lost on restart. Persist it the same way as trials.
+#
 # To swap in SQLite:
 #   - Create a `trials` table: chat_id INTEGER PRIMARY KEY, message_id,
 #     prosecutor_id, defendant_id, crime TEXT, phase TEXT,
 #     jurors TEXT (JSON), votes TEXT (JSON), created_at TIMESTAMP.
+#   - Create a `rap_sheets` table: chat_id, user_id, guilty, innocent, hung.
 #   - Replace `active_trials[chat_id] = trial` with an INSERT/UPDATE, and
 #     `active_trials.pop(chat_id)` with a DELETE.
 #   - Replace `active_trials.get(chat_id)` with a SELECT + json.loads(...).
@@ -101,11 +182,22 @@ class Trial:
     jurors: Dict[int, str] = field(default_factory=dict)      # user_id -> name
     phase: str = "lobby"                                      # "lobby" | "voting"
     has_photo: bool = True
+    objection_used: bool = False
     task: Optional[asyncio.Task] = None
     ended: bool = False
 
 
 active_trials: Dict[int, Trial] = {}
+rap_sheets: Dict[int, Dict[int, dict]] = {}
+
+
+def record_result(chat_id: int, user_id: int, name: str, outcome: str) -> None:
+    """outcome: 'guilty' | 'innocent' | 'hung'"""
+    sheet = rap_sheets.setdefault(chat_id, {}).setdefault(
+        user_id, {"name": name, "guilty": 0, "innocent": 0, "hung": 0}
+    )
+    sheet["name"] = name
+    sheet[outcome] += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -150,7 +242,7 @@ def build_lobby_keyboard(trial: Trial) -> InlineKeyboardMarkup:
 def build_keyboard(trial: Trial) -> InlineKeyboardMarkup:
     guilty_count = sum(1 for v in trial.votes.values() if v == "guilty")
     innocent_count = sum(1 for v in trial.votes.values() if v == "innocent")
-    buttons = [
+    rows = [
         [
             InlineKeyboardButton(
                 f"🔨 GUILTY ({guilty_count})",
@@ -162,7 +254,14 @@ def build_keyboard(trial: Trial) -> InlineKeyboardMarkup:
             ),
         ]
     ]
-    return InlineKeyboardMarkup(buttons)
+    if not trial.objection_used:
+        rows.append([
+            InlineKeyboardButton(
+                "🗣️ OBJECTION! (defendant only)",
+                callback_data=f"obj|{trial.chat_id}",
+            )
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def lobby_caption(trial: Trial) -> str:
@@ -184,7 +283,8 @@ def voting_caption(trial: Trial) -> str:
         f"*Defendant:* {escape_md(trial.defendant_name)}\n"
         f"*Charge:* {escape_md(trial.crime)}\n"
         f"*Jurors:* {len(trial.jurors)}\n\n"
-        f"Jurors, you have *{TRIAL_DURATION_SECONDS} seconds* to cast your verdict."
+        f"Jurors, you have *{TRIAL_DURATION_SECONDS} seconds* to cast your verdict.\n"
+        "_The defendant has one OBJECTION. Use it wisely._"
     )
 
 
@@ -433,6 +533,77 @@ async def indict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Command: /rapsheet
+# --------------------------------------------------------------------------- #
+
+async def rapsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+
+    target: User = (
+        message.reply_to_message.from_user
+        if message.reply_to_message and message.reply_to_message.from_user
+        else message.from_user
+    )
+    name = target.first_name or target.username or "Unknown"
+    sheet = rap_sheets.get(chat_id, {}).get(target.id)
+
+    if not sheet:
+        await message.reply_text(
+            f"📂 {name} has a spotless record in this court. Suspiciously spotless."
+        )
+        return
+
+    total = sheet["guilty"] + sheet["innocent"] + sheet["hung"]
+    await message.reply_text(
+        f"📂 RAP SHEET: {name}\n\n"
+        f"Trials: {total}\n"
+        f"🔨 Guilty: {sheet['guilty']}\n"
+        f"😇 Innocent: {sheet['innocent']}\n"
+        f"🤷 Hung juries: {sheet['hung']}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Silence /start, and quip on every other unknown command
+# --------------------------------------------------------------------------- #
+
+async def ignore_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deliberately does nothing: the bot never answers /start."""
+    return
+
+
+async def random_command_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all for commands we don't handle. Only reached when no earlier
+    CommandHandler matched, so /indict, /rapsheet and /start never land here."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    # Skip commands explicitly addressed to some other bot (/cmd@otherbot).
+    first_token = message.text.split()[0]
+    if "@" in first_token:
+        addressed_to = first_token.split("@", 1)[1].lower()
+        if addressed_to != (context.bot.username or "").lower():
+            return
+
+    # Ignore stale commands (e.g. delivered late after a restart).
+    age = (datetime.now(timezone.utc) - message.date).total_seconds()
+    if age > MAX_COMMAND_AGE_SECONDS:
+        return
+
+    if random.random() > RANDOM_REPLY_CHANCE:
+        return
+
+    try:
+        await send_with_retry(
+            message.reply_text, random.choice(QUIPS), parse_mode=ParseMode.MARKDOWN
+        )
+    except (BadRequest, Forbidden, TimedOut, NetworkError) as e:
+        logger.warning("Could not send quip: %s", e)
+
+
+# --------------------------------------------------------------------------- #
 # Joining the jury (lobby phase)
 # --------------------------------------------------------------------------- #
 
@@ -530,13 +701,79 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------- #
+# Objection! (defendant's one-time button)
+# --------------------------------------------------------------------------- #
+
+async def handle_objection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split("|")
+
+    try:
+        chat_id = int(parts[1])
+    except (IndexError, ValueError):
+        await query.answer("Malformed objection.", show_alert=True)
+        return
+
+    trial = active_trials.get(chat_id)
+    if (not trial or trial.ended or trial.phase != "voting"
+            or query.message.message_id != trial.message_id):
+        await query.answer("Nothing to object to right now.", show_alert=True)
+        return
+
+    if user.id != trial.defendant_id:
+        await query.answer("Only the defendant may object!", show_alert=True)
+        return
+
+    if trial.objection_used:
+        await query.answer("You already used your objection.", show_alert=True)
+        return
+
+    trial.objection_used = True
+    sustained = random.random() < OBJECTION_SUSTAIN_CHANCE
+
+    if sustained:
+        guilty_voters = [uid for uid, v in trial.votes.items() if v == "guilty"]
+        if guilty_voters:
+            struck = random.choice(guilty_voters)
+            trial.votes.pop(struck, None)
+            trial.voter_names.pop(struck, None)
+            reply = random.choice(OBJECTION_SUSTAINED)
+        else:
+            reply = "🧑‍⚖️ *SUSTAINED!* ...but there were no guilty votes to strike. Awkward."
+    else:
+        reply = random.choice(OBJECTION_OVERRULED)
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=build_keyboard(trial))
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("Failed to refresh keyboard after objection: %s", e)
+    except (TimedOut, NetworkError) as e:
+        logger.warning("Network hiccup updating keyboard: %s", e)
+
+    await query.answer("OBJECTION! Your plea has been heard.")
+
+    try:
+        await send_with_retry(
+            context.bot.send_message,
+            chat_id=chat_id,
+            text=f"🗣️ *{escape_md(trial.defendant_name)}: OBJECTION!*\n\n{reply}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.warning("Could not post objection result in %s: %s", chat_id, e)
+
+
+# --------------------------------------------------------------------------- #
 # Verdict & enforcement
 # --------------------------------------------------------------------------- #
 
-async def try_mute(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+async def try_mute(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
+                   duration_seconds: int) -> bool:
     """Attempt to mute the defendant. Returns True on success, False if the
     bot isn't an admin / lacks restrict rights (never raises)."""
-    until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_DURATION_SECONDS)
+    until = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
     permissions = ChatPermissions(can_send_messages=False)
     try:
         await context.bot.restrict_chat_member(
@@ -549,6 +786,11 @@ async def try_mute(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: in
     except BadRequest as e:
         logger.warning("Could not restrict user %s in chat %s: %s", user_id, chat_id, e)
         return False
+
+
+def sentence_seconds(margin: int) -> int:
+    """Mute length grows with the guilty margin, capped."""
+    return min(MUTE_BASE_SECONDS + max(margin - 1, 0) * MUTE_STEP_SECONDS, MUTE_MAX_SECONDS)
 
 
 async def run_trial_timer(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -571,7 +813,7 @@ async def run_trial_timer(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> N
             f"Only {len(trial.jurors)}/{MIN_JURORS} jurors showed up in "
             f"{LOBBY_DURATION_SECONDS} seconds.\n"
             f"The case against *{escape_md(trial.defendant_name)}* is dismissed. "
-            "Lucky them. 🍀",
+            f"{random.choice(DISMISS_LINES)}",
             None,
         )
         return
@@ -597,11 +839,13 @@ async def conclude_trial(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
     innocent_count = sum(1 for v in trial.votes.values() if v == "innocent")
 
     if guilty_count > innocent_count:
-        verdict = "GUILTY"
+        verdict, outcome, flavor = "GUILTY", "guilty", random.choice(GUILTY_LINES)
     elif innocent_count > guilty_count:
-        verdict = "INNOCENT"
+        verdict, outcome, flavor = "INNOCENT", "innocent", random.choice(INNOCENT_LINES)
     else:
-        verdict = "HUNG JURY"
+        verdict, outcome, flavor = "HUNG JURY", "hung", random.choice(HUNG_LINES)
+
+    record_result(chat_id, trial.defendant_id, trial.defendant_name, outcome)
 
     result_text = (
         "⚖️ *THE COURT HAS REACHED A VERDICT* ⚖️\n\n"
@@ -609,7 +853,8 @@ async def conclude_trial(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
         f"*Charge:* {escape_md(trial.crime)}\n"
         f"*Jurors:* {len(trial.jurors)}\n"
         f"*Votes:* 🔨 {guilty_count}  vs  😇 {innocent_count}\n\n"
-        f"*VERDICT: {verdict}*"
+        f"*VERDICT: {verdict}*\n"
+        f"_{flavor}_"
     )
 
     # Freeze the trial message so nobody can keep voting on a decided case.
@@ -624,17 +869,24 @@ async def conclude_trial(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
 
     enforcement_note = ""
     if verdict == "GUILTY":
-        muted = await try_mute(context, chat_id, trial.defendant_id)
+        margin = guilty_count - innocent_count
+        duration = sentence_seconds(margin)
+        muted = await try_mute(context, chat_id, trial.defendant_id, duration)
+        service = random.choice(COMMUNITY_SERVICE)
+        landslide = "\n🌋 *LANDSLIDE VERDICT.* The court shows no mercy." if margin >= 4 else ""
         if muted:
             enforcement_note = (
                 f"\n\n🔇 The defendant has been silenced for "
-                f"{MUTE_DURATION_SECONDS // 60} minute(s)."
+                f"{duration // 60} minute(s)."
+                f"{landslide}\n"
+                f"🧹 *Community service:* {service}"
             )
         else:
             enforcement_note = (
                 "\n\n📢 *PUBLIC SHAMING SENTENCE*: the bot isn't an admin here, so it "
                 "can't mute anyone — let it be known across the group that justice was "
-                "served in spirit, if not in silence."
+                f"served in spirit, if not in silence.{landslide}\n"
+                f"🧹 *Community service:* {service}"
             )
 
     try:
@@ -666,9 +918,16 @@ def main() -> None:
 
     app = ApplicationBuilder().token(token).post_init(post_init).build()
 
+    # Order matters: handlers in the same group are checked top to bottom and
+    # the first match wins. /start must come before the catch-all.
+    app.add_handler(CommandHandler("start", ignore_start))
     app.add_handler(CommandHandler("indict", indict))
+    app.add_handler(CommandHandler("rapsheet", rapsheet))
     app.add_handler(CallbackQueryHandler(handle_join, pattern=r"^join\|"))
     app.add_handler(CallbackQueryHandler(handle_vote, pattern=r"^vote\|"))
+    app.add_handler(CallbackQueryHandler(handle_objection, pattern=r"^obj\|"))
+    # Catch-all for every other command (must be registered LAST).
+    app.add_handler(MessageHandler(filters.COMMAND, random_command_reply))
 
     logger.info("Starting Meme Court bot (long polling)...")
     # drop_pending_updates=True discards everything users sent while the bot was
