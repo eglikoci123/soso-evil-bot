@@ -11,6 +11,8 @@ Flow
 4. Only jurors vote. Verdict is tallied, defendant is muted if GUILTY
    (when the bot has admin rights).
 
+The bot stays completely silent on /start.
+
 Architecture
 ------------
 - python-telegram-bot v20+ (async, ApplicationBuilder)
@@ -331,6 +333,15 @@ async def fetch_avatar_bytes(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
     except Exception as e:
         logger.warning("Failed downloading avatar for %s: %s", user_id, e)
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Command: /start  (intentionally silent)
+# --------------------------------------------------------------------------- #
+
+async def ignore_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The bot never replies to /start, in private chats or groups."""
+    return
 
 
 # --------------------------------------------------------------------------- #
@@ -657,6 +668,7 @@ def main() -> None:
 
     app = ApplicationBuilder().token(token).post_init(post_init).build()
 
+    app.add_handler(CommandHandler("start", ignore_start))
     app.add_handler(CommandHandler("indict", indict))
     app.add_handler(CallbackQueryHandler(handle_join, pattern=r"^join\|"))
     app.add_handler(CallbackQueryHandler(handle_vote, pattern=r"^vote\|"))
