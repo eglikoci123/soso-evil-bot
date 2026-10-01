@@ -32,8 +32,11 @@ import random
 import asyncio
 import logging
 
-from dotenv import load_dotenv  # local dev convenience: loads .env if present
-
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 load_dotenv()
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
