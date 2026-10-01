@@ -943,6 +943,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_objection, pattern=r"^obj\|"))
     # Catch-all for every other command (must be registered LAST).
     app.add_handler(MessageHandler(filters.COMMAND, random_command_reply))
+# Start health check server on a background thread
+    threading.Thread(target=start_health_check_server, daemon=True).start()
 
     logger.info("Starting Meme Court bot (long polling)...")
     # drop_pending_updates=True discards everything users sent while the bot was
@@ -953,5 +955,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    # Start health check server on a background thread
-    threading.Thread(target=start_health_check_server, daemon=True).start()
