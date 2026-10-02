@@ -24,21 +24,23 @@ Architecture
 - In-memory state (`active_trials`, `rap_sheets`) — see the comment below for
   how to swap in SQLite/Redis.
 - Pillow generates a "WANTED" mugshot PNG in memory (io.BytesIO).
+- A tiny HTTP server + self-ping loop keeps a Render Free Web Service awake.
 """
 
 import io
 import os
+import time
 import random
 import asyncio
 import logging
-
-from dotenv import load_dotenv  # local dev convenience: loads .env if present
-
-load_dotenv()
+import threading
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Optional
 
+from dotenv import load_dotenv  # local dev convenience: loads .env if present
 from PIL import Image, ImageDraw, ImageFont
 
 from telegram import (
@@ -58,22 +60,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 
-# Dummy server to pass Render's Free Web Service port check
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass  # Keeps logs clean
+load_dotenv()
 
-def start_health_check_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -93,6 +82,50 @@ MUTE_MAX_SECONDS = 600          # hard cap (10 minutes)
 MAX_COMMAND_AGE_SECONDS = 60    # commands older than this are ignored as stale
 OBJECTION_SUSTAIN_CHANCE = 0.30 # chance the judge sustains an objection
 RANDOM_REPLY_CHANCE = 1.0       # 1.0 = always quip on unknown commands; 0.5 = half the time
+KEEP_ALIVE_INTERVAL_SECONDS = 600  # self-ping every 10 minutes
+
+# --------------------------------------------------------------------------- #
+# Keep-alive web server (for Render Free Web Service)
+# --------------------------------------------------------------------------- #
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Answers GET and HEAD (UptimeRobot's free plan uses HEAD)."""
+
+    def _ok(self, body: bool = True) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        if body:
+            self.wfile.write(b"OK")
+
+    def do_GET(self):
+        self._ok()
+
+    def do_HEAD(self):
+        self._ok(body=False)
+
+    def log_message(self, format, *args):
+        pass  # keeps logs clean
+
+
+def start_health_check_server() -> None:
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), HealthCheckHandler).serve_forever()
+
+
+def keep_alive_loop() -> None:
+    """Ping our own public URL so Render sees inbound traffic.
+    RENDER_EXTERNAL_URL is set automatically by Render."""
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        logger.info("RENDER_EXTERNAL_URL not set; self-ping disabled.")
+        return
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
+        try:
+            urllib.request.urlopen(url, timeout=15).read()
+        except Exception as e:
+            logger.warning("Keep-alive ping failed: %s", e)
 
 # --------------------------------------------------------------------------- #
 # Flavor text
@@ -931,6 +964,11 @@ def main() -> None:
             "Export it locally or set it in Render's dashboard — never hardcode it."
         )
 
+    # Start the web server FIRST so Render's port check passes quickly,
+    # then the self-ping loop that keeps the free service from sleeping.
+    threading.Thread(target=start_health_check_server, daemon=True).start()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
+
     app = ApplicationBuilder().token(token).post_init(post_init).build()
 
     # Order matters: handlers in the same group are checked top to bottom and
@@ -943,8 +981,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_objection, pattern=r"^obj\|"))
     # Catch-all for every other command (must be registered LAST).
     app.add_handler(MessageHandler(filters.COMMAND, random_command_reply))
-# Start health check server on a background thread
-    threading.Thread(target=start_health_check_server, daemon=True).start()
 
     logger.info("Starting Meme Court bot (long polling)...")
     # drop_pending_updates=True discards everything users sent while the bot was
