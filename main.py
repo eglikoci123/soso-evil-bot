@@ -15,8 +15,7 @@ Flow
 Extras
 ------
 - /rapsheet  -> shows a user's record in this chat (reply to someone, or self)
-- Any unknown command gets a random judge quip.
-- /start is deliberately ignored (no reply at all).
+- The bot only reacts to /indict and /rapsheet. Everything else is ignored.
 
 Architecture
 ------------
@@ -56,9 +55,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
 load_dotenv()
@@ -81,7 +78,6 @@ MUTE_STEP_SECONDS = 90          # extra mute per additional vote of margin
 MUTE_MAX_SECONDS = 600          # hard cap (10 minutes)
 MAX_COMMAND_AGE_SECONDS = 60    # commands older than this are ignored as stale
 OBJECTION_SUSTAIN_CHANCE = 0.30 # chance the judge sustains an objection
-RANDOM_REPLY_CHANCE = 1.0       # 1.0 = always quip on unknown commands; 0.5 = half the time
 KEEP_ALIVE_INTERVAL_SECONDS = 600  # self-ping every 10 minutes
 
 # --------------------------------------------------------------------------- #
@@ -130,24 +126,6 @@ def keep_alive_loop() -> None:
 # --------------------------------------------------------------------------- #
 # Flavor text
 # --------------------------------------------------------------------------- #
-
-QUIPS = [
-    "⚖️ The court has no idea what that command means, and neither do I.",
-    "🔨 *BANG BANG.* Order! ...I forgot why I did that.",
-    "🧑‍⚖️ Objection! ...to whatever you just typed.",
-    "📜 The bailiff has read your command and chose to laugh.",
-    "🏛️ This is a court, not a help desk. Try /indict.",
-    "🥱 The judge is currently on a snack break. Please hold.",
-    "👀 The court is watching. The court is always watching.",
-    "🕵️ Noted. This has been added to your file. Don't ask what file.",
-    "🍿 The jury is bored. Indict someone already.",
-    "🐐 Sustained. Overruled. Whatever. Moving on.",
-    "🤨 The court finds that command... suspicious.",
-    "🧂 The judge has seen your type of command before. Salty.",
-    "📞 Your lawyer is not picking up. Try again later.",
-    "🪑 Please remain seated. Nobody asked you anything.",
-    "🎭 Dramatic gavel noises. The command is denied.",
-]
 
 GUILTY_LINES = [
     "The court has seen enough. Take them away.",
@@ -613,45 +591,6 @@ async def rapsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Silence /start, and quip on every other unknown command
-# --------------------------------------------------------------------------- #
-
-async def ignore_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Deliberately does nothing: the bot never answers /start."""
-    return
-
-
-async def random_command_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch-all for commands we don't handle. Only reached when no earlier
-    CommandHandler matched, so /indict, /rapsheet and /start never land here."""
-    message = update.effective_message
-    if not message or not message.text:
-        return
-
-    # Skip commands explicitly addressed to some other bot (/cmd@otherbot).
-    first_token = message.text.split()[0]
-    if "@" in first_token:
-        addressed_to = first_token.split("@", 1)[1].lower()
-        if addressed_to != (context.bot.username or "").lower():
-            return
-
-    # Ignore stale commands (e.g. delivered late after a restart).
-    age = (datetime.now(timezone.utc) - message.date).total_seconds()
-    if age > MAX_COMMAND_AGE_SECONDS:
-        return
-
-    if random.random() > RANDOM_REPLY_CHANCE:
-        return
-
-    try:
-        await send_with_retry(
-            message.reply_text, random.choice(QUIPS), parse_mode=ParseMode.MARKDOWN
-        )
-    except (BadRequest, Forbidden, TimedOut, NetworkError) as e:
-        logger.warning("Could not send quip: %s", e)
-
-
-# --------------------------------------------------------------------------- #
 # Joining the jury (lobby phase)
 # --------------------------------------------------------------------------- #
 
@@ -971,16 +910,11 @@ def main() -> None:
 
     app = ApplicationBuilder().token(token).post_init(post_init).build()
 
-    # Order matters: handlers in the same group are checked top to bottom and
-    # the first match wins. /start must come before the catch-all.
-    app.add_handler(CommandHandler("start", ignore_start))
     app.add_handler(CommandHandler("indict", indict))
     app.add_handler(CommandHandler("rapsheet", rapsheet))
     app.add_handler(CallbackQueryHandler(handle_join, pattern=r"^join\|"))
     app.add_handler(CallbackQueryHandler(handle_vote, pattern=r"^vote\|"))
     app.add_handler(CallbackQueryHandler(handle_objection, pattern=r"^obj\|"))
-    # Catch-all for every other command (must be registered LAST).
-    app.add_handler(MessageHandler(filters.COMMAND, random_command_reply))
 
     logger.info("Starting Meme Court bot (long polling)...")
     # drop_pending_updates=True discards everything users sent while the bot was
